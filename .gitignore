@@ -1,0 +1,6 @@
+.env
+/bin
+/bin/
+session.*
+*.log
+session.*
