@@ -35,24 +35,37 @@ func prompt(msg string) string {
 
 // ---------- скачивание через yt-dlp ----------
 
-type videoInfo struct {
+type mediaInfo struct {
 	Path     string
+	Title    string
 	Duration float64
 	Width    int
 	Height   int
 }
 
-func downloadVideo(ctx context.Context, url, dir string) (*videoInfo, error) {
+func downloadMedia(ctx context.Context, url, dir string, audio bool) (*mediaInfo, error) {
 	args := []string{
-		"-f", "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/b",
-		"--merge-output-format", "mp4",
 		"--no-playlist",
 		"--progress",
 		"--no-simulate",
 		"--print", "after_move:%(duration)s",
 		"--print", "after_move:%(width)s",
 		"--print", "after_move:%(height)s",
-		"-o", filepath.Join(dir, "video.%(ext)s"),
+		"--print", "after_move:%(title)s",
+		"-o", filepath.Join(dir, "media.%(ext)s"),
+	}
+	ext := ".mp4"
+	if audio {
+		ext = ".mp3"
+		args = append(args,
+			"-f", "ba/b",
+			"-x", "--audio-format", "mp3", "--audio-quality", "0",
+		)
+	} else {
+		args = append(args,
+			"-f", "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/b",
+			"--merge-output-format", "mp4",
+		)
 	}
 	if b := os.Getenv("YTDLP_COOKIES_BROWSER"); b != "" {
 		args = append(args, "--cookies-from-browser", b)
@@ -66,7 +79,7 @@ func downloadVideo(ctx context.Context, url, dir string) (*videoInfo, error) {
 		return nil, fmt.Errorf("yt-dlp: %w", err)
 	}
 
-	info := &videoInfo{}
+	info := &mediaInfo{}
 	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
 	if len(lines) > 0 {
 		info.Duration, _ = strconv.ParseFloat(strings.TrimSpace(lines[0]), 64)
@@ -77,19 +90,47 @@ func downloadVideo(ctx context.Context, url, dir string) (*videoInfo, error) {
 	if len(lines) > 2 {
 		info.Height, _ = strconv.Atoi(strings.TrimSpace(lines[2]))
 	}
+	if len(lines) > 3 {
+		info.Title = strings.TrimSpace(lines[3])
+	}
 
 	// ищем итоговый файл сами, не полагаясь на путь из вывода yt-dlp
-	matches, _ := filepath.Glob(filepath.Join(dir, "video.*"))
+	matches, _ := filepath.Glob(filepath.Join(dir, "media.*"))
 	for _, m := range matches {
-		if strings.HasSuffix(m, ".mp4") {
+		if strings.HasSuffix(m, ext) {
 			info.Path = m
 			break
 		}
 	}
 	if info.Path == "" {
-		return nil, fmt.Errorf("mp4 не найден в %s, есть файлы: %q", dir, matches)
+		return nil, fmt.Errorf("%s не найден в %s, есть файлы: %q", ext, dir, matches)
 	}
 	return info, nil
+}
+
+// askFormat возвращает true, если нужен mp3.
+func askFormat() bool {
+	// можно передать формат вторым аргументом: ./tgsend "url" mp3
+	if len(os.Args) > 2 {
+		return strings.EqualFold(os.Args[2], "mp3")
+	}
+	for {
+		switch strings.ToLower(prompt("Формат: 1 - mp4 (видео), 2 - mp3 (аудио) [1]: ")) {
+		case "", "1", "mp4":
+			return false
+		case "2", "mp3":
+			return true
+		}
+		fmt.Println("Введите 1 или 2.")
+	}
+}
+
+func safeName(s string) string {
+	s = strings.NewReplacer("/", "_", "\\", "_").Replace(s)
+	if s == "" {
+		return "audio"
+	}
+	return s
 }
 
 // ---------- вход по QR ----------
@@ -294,6 +335,8 @@ func run() error {
 			return err
 		}
 
+		audio := askFormat()
+
 		dir, err := os.MkdirTemp("", "tgsend-*")
 		if err != nil {
 			return err
@@ -301,26 +344,39 @@ func run() error {
 		defer os.RemoveAll(dir)
 
 		fmt.Println("Скачиваю...")
-		vid, err := downloadVideo(ctx, url, dir)
+		m, err := downloadMedia(ctx, url, dir, audio)
 		if err != nil {
 			return err
 		}
-		fmt.Println("Скачано:", vid.Path)
+		fmt.Println("Скачано:", m.Path)
 
 		u := uploader.NewUploader(api).WithProgress(progress{})
-		file, err := u.FromPath(ctx, vid.Path)
+		file, err := u.FromPath(ctx, m.Path)
 		if err != nil {
 			return err
 		}
 
-		doc := message.UploadedDocument(file).
-			MIME("video/mp4").
-			Attributes(&tg.DocumentAttributeVideo{
-				SupportsStreaming: true,
-				Duration:          vid.Duration,
-				W:                 vid.Width,
-				H:                 vid.Height,
-			})
+		var mime string
+		var attrs []tg.DocumentAttributeClass
+		if audio {
+			mime = "audio/mpeg"
+			attrs = []tg.DocumentAttributeClass{
+				&tg.DocumentAttributeAudio{Duration: int(m.Duration), Title: m.Title},
+				&tg.DocumentAttributeFilename{FileName: safeName(m.Title) + ".mp3"},
+			}
+		} else {
+			mime = "video/mp4"
+			attrs = []tg.DocumentAttributeClass{
+				&tg.DocumentAttributeVideo{
+					SupportsStreaming: true,
+					Duration:          m.Duration,
+					W:                 m.Width,
+					H:                 m.Height,
+				},
+			}
+		}
+
+		doc := message.UploadedDocument(file).MIME(mime).Attributes(attrs...)
 
 		sender := message.NewSender(api).WithUploader(u)
 		if _, err := sender.To(peer).Media(ctx, doc); err != nil {
